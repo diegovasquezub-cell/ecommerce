@@ -1,0 +1,15 @@
+# Secretos
+.env
+
+# Entorno y caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.langgraph_api/
+
+# Datos locales
+*.db
+*.sqlite
+*.sqlite3
+data/
