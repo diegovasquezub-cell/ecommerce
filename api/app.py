@@ -1,11 +1,13 @@
+import hmac
 import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Literal
 
+import httpx
 import truststore
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 truststore.inject_into_ssl()  # usa los certificados de Windows (proxy/antivirus con SSL propio)
@@ -14,6 +16,8 @@ load_dotenv()
 from src.router.graph import build_graph  # noqa: E402
 
 log = logging.getLogger("api")
+# httpx registra la URL de cada request y la de Telegram lleva el token: no loguearla
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 DESCRIPCION = """
 API del chat de un ecommerce. Un **router** con IA lee el mensaje del cliente y lo
@@ -110,7 +114,38 @@ def chat(body: ChatRequest, request: Request):
     return {"ruta": r["ruta"], "motivo": r["motivo"], "respuesta": r["respuesta"]}
 
 
+def _responder_telegram(graph, chat_id: int, texto: str) -> None:
+    """Corre el router y envía la respuesta al usuario. Nunca lanza: Telegram ya recibió 200."""
+    try:
+        config = {"configurable": {"thread_id": str(chat_id)}}
+        r = graph.invoke({"mensaje": texto, "messages": [("user", texto)]}, config)
+        log.info("telegram chat_id=%s ruta=%s", chat_id, r["ruta"])
+        respuesta = r["respuesta"]
+    except Exception:
+        log.exception("Falló el grafo para chat_id=%s", chat_id)
+        respuesta = "Tuve un problema para procesar tu mensaje. Intenta de nuevo en un momento."
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{os.getenv('TELEGRAM_TOKEN')}/sendMessage",
+            json={"chat_id": chat_id, "text": respuesta},
+            timeout=15,
+        ).raise_for_status()
+    except Exception as e:
+        # no loguear la excepción completa: su mensaje incluye la URL con el token
+        log.error("No se pudo enviar el mensaje a chat_id=%s (%s)", chat_id, type(e).__name__)
+
+
 @app.post("/telegram", tags=["telegram"], include_in_schema=False)
-async def telegram(request: Request):
-    await request.json()
+async def telegram(request: Request, background: BackgroundTasks):
+    secreto = os.getenv("TELEGRAM_SECRET") or ""
+    recibido = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not secreto or not hmac.compare_digest(recibido, secreto):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    update = await request.json()
+    mensaje = update.get("message") or {}
+    texto = mensaje.get("text")
+    chat_id = (mensaje.get("chat") or {}).get("id")
+    if texto and chat_id is not None:
+        background.add_task(_responder_telegram, request.app.state.graph, chat_id, texto)
     return {"ok": True}
